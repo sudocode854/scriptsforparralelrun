@@ -1,0 +1,407 @@
+#!/bin/zsh
+##########################################################################
+# Script:         RunRefresh_max
+# Author:         Natasha Yanayt -  Tessera Enterprise Systems
+# SCCS ID:        @(#)RunRefresh_max  1.1 12/27/01 07:23:23
+# Description: This script runs refresh process of the data warehouse.
+#
+# Options:        One of the two mutually exclusive options must be
+#                 specified:
+#                   -s            start
+#                   -r BATCH_ID   restart
+#                   -i INSTANCE   run against specified instance
+#                   -g GROUP(S)   process specified groups
+# Argument:       Batch_ID - must be specified for restart only
+# Modifications: Refresh_SID is added.
+#RunRefresh_max created for Max job process on SEP2026.
+##########################################################################
+# [ADDED] DEPENDENCIES OF THIS SCRIPT
+# (items marked "assumed" are inferred from this script only; the code of
+#  the functions was not available, so verify them)
+#
+# 1. Runtime
+#    - zsh at /bin/zsh; commands: mkdir, rm, cat, kill, sleep, ps, grep,
+#      /usr/bin/pwd
+#    - All runs of this script must be started by the same OS user
+#      (they share the lock folder)
+#
+# 2. Files and folders
+#    - ../env/.aigenv                 environment file (must exist)
+#    - ${AIGWRAPPER}/UpdateFuncs      function library
+#    - ${AIGWRAPPER}/UtilityFuncs     function library
+#    - Current directory must equal ${AIGWRAPPER} (else error 68)
+#    - ${LOGDIR}                      main log folder (assumed from .aigenv)
+#    - ${LOCKROOT}                    lock folder created by this script:
+#                                     /tmp/RunRefresh_max_<SID>_locks
+#                                     (override: RUNREFRESH_MAX_LOCKDIR)
+#
+# 3. Environment variables (assumed to come from .aigenv / the libraries)
+#    AIGWRAPPER, LOGDIR, ORACLE_SID, AIGU, STATUS_MAIL_LIST, stage_dir,
+#    message (set by fnErrorHandler)
+#
+# 4. Variables set by fnCheckOptions
+#    GROUP, REFRESH_INSTANCE, BATCH_ID, start, restart
+#
+# 5. Functions (assumed to be defined in UpdateFuncs / UtilityFuncs)
+#    fnCreateTranslationList  fnCheckOptions     fnCheckRun
+#    fnErrorHandler           fnMail             fnCheckDirectories
+#    fnMLog                   fnPreloadUnknownFiles   fnCheckFeeders
+#    fnInitPC                 fnCmd (3,4,5,6)    fnRunSql
+#    fnRemoveFailureFile      fnRunProcesses     fnUpdtPC_PtoW
+#    fnFinalDump              fnMailStatus
+#
+# 6. Database objects (from the comments of fnCmd 3 to 6)
+#    DROP_PRIVILEGE.granted / DROP_PRIVILEGE.revoked
+#    tablespace_mode.write  / tablespace_mode.read
+#    Production_Control table
+#
+# 7. Shared with the original RunRefresh (NOT verified)
+#    UpdateFuncs, UtilityFuncs, Production_Control, stage directories,
+#    preload_unknown directory, failure file, STATUS_MAIL_LIST, drop
+#    privilege and tablespace mode, and fnCheckRun (may match script names).
+#
+# 8. Exit codes
+#    0 success, 1 missing .aigenv / already running / lock timeout,
+#    68 not started from the WRAPPER directory, others come from the
+#    functions. The exit code is passed on unchanged after cleanup.
+#
+# 9. Switches added for independence
+#    USE_ORIGINAL_FNCHECKRUN=1     call the original fnCheckRun $0
+#                                  (default 0: own per-group lock is used)
+#    CHECK_ORIGINAL_RUNREFRESH=0   do not look for a running RunRefresh
+#                                  before revoking (default 1: look)
+#    RUNREFRESH_MAX_LOCKDIR        change the lock folder
+##########################################################################
+
+#set -xv
+
+if [[ ! -f ../env/.aigenv ]]
+then
+        echo "Please start the refresh from the $AIGWRAPPER directory"
+        exit 1
+fi
+
+. ../env/.aigenv
+. ${AIGWRAPPER}/UpdateFuncs
+. ${AIGWRAPPER}/UtilityFuncs
+
+#exit 0
+
+export BATCH_ID=""
+typeset -u GROUP
+typeset -u REFRESH_INSTANCE
+export Refresh_SID=${ORACLE_SID}
+typeset -u Refresh_SID
+typeset -u GROUPTOAPPENDTOEMAIL
+export GROUP=""
+export GROUPTOAPPENDTOEMAIL=""
+export start=0
+export restart=0
+export MANDATORY="YES"
+
+# [ADDED] START - lock folder and helper functions
+LOCKROOT=${RUNREFRESH_MAX_LOCKDIR:-/tmp/RunRefresh_max_${Refresh_SID:-NOSID}_locks}
+mkdir -p ${LOCKROOT} || { echo "Cannot create ${LOCKROOT}"; exit 1; }
+SHARED_ACQUIRED=0
+HAVE_RUN_LOCK=0
+LIVE=0
+RUNKEY=""
+RUNLOCK=""
+ACTIVEDIR=""
+SHARED_MUTEX=""
+
+fnPidAlive() {
+        kill -0 $1 2>/dev/null || ps -p $1 > /dev/null 2>&1
+}
+
+# $1 = lock dir, $2 = 1 to wait (mutex) or 0 to fail at once (run lock)
+fnLock() {
+        local d=$1 waitmode=${2:-0} owner tries=0
+        until mkdir ${d} 2>/dev/null
+        do
+                owner=$(cat ${d}/pid 2>/dev/null)
+                [[ ${owner} == $$ ]] && return 0
+                if [[ -n ${owner} ]] && ! fnPidAlive ${owner}
+                then
+                        rm -rf ${d}
+                        continue
+                fi
+                (( waitmode )) || return 1
+                if (( ++tries > 600 ))
+                then
+                        echo "Timeout waiting for lock ${d}" >&2
+                        return 2
+                fi
+                sleep 1
+        done
+        print -r -- $$ > ${d}/pid
+}
+
+fnUnlockIfMine() {
+        [[ $(cat $1/pid 2>/dev/null) == $$ ]] && rm -rf $1
+}
+
+# sets LIVE = number of other runs really alive, removes dead entries
+fnCountLiveRuns() {
+        local f p
+        LIVE=0
+        for f in ${ACTIVEDIR}/*(N)
+        do
+                p=$(<${f})
+                if [[ -n ${p} ]] && fnPidAlive ${p}
+                then
+                        (( ++LIVE ))
+                else
+                        rm -f ${f}
+                fi
+        done
+}
+
+# returns 0 if the original RunRefresh (not RunRefresh_max) is running
+fnOriginalRefreshAlive() {
+        (( ${CHECK_ORIGINAL_RUNREFRESH:-1} )) || return 1
+        ps -ef 2>/dev/null | grep -E '(^|[ /])RunRefresh( |$)' | grep -v grep > /dev/null
+}
+
+fnAcquireShared() {
+        fnLock ${SHARED_MUTEX} 1 || exit 1
+        fnCountLiveRuns
+        if (( LIVE == 0 ))
+        then
+                fnMLog "--- INFO:  First active refresh run: granting privileges and setting tablespaces to write."
+                fnCmd 3
+                fnRunSql
+                fnCmd 4
+                fnRunSql
+        else
+                fnMLog "--- INFO:  ${LIVE} other refresh run(s) active: privileges/tablespace mode already set."
+        fi
+        print -r -- $$ > ${ACTIVEDIR}/${RUNKEY}.pid
+        SHARED_ACQUIRED=1
+        fnUnlockIfMine ${SHARED_MUTEX}
+}
+
+fnReleaseShared() {
+        (( SHARED_ACQUIRED )) || return 0
+        fnLock ${SHARED_MUTEX} 1 || return 1
+        rm -f ${ACTIVEDIR}/${RUNKEY}.pid
+        SHARED_ACQUIRED=0
+        fnCountLiveRuns
+        if (( LIVE == 0 )) && ! fnOriginalRefreshAlive
+        then
+                fnMLog "--- INFO:  Last active refresh run: revoking privileges and setting tablespaces to read only."
+                fnCmd 5
+                fnRunSql
+                fnCmd 6
+                fnRunSql
+        else
+                fnMLog "--- INFO:  Other refresh run(s) still active (${LIVE} RunRefresh_max, or RunRefresh): privileges/tablespace mode left unchanged."
+        fi
+        fnUnlockIfMine ${SHARED_MUTEX}
+}
+
+fnCleanup() {
+        local rc=$?
+        fnReleaseShared
+        fnUnlockIfMine ${SHARED_MUTEX}
+        fnUnlockIfMine ${LOCKROOT}/setup.mutex
+        (( HAVE_RUN_LOCK )) && rm -rf ${RUNLOCK}
+        exit ${rc}
+}
+# [ADDED] END
+
+#-----------------------------------------------------------------------
+# Build translation file before refresh start - language dependent errors
+#-----------------------------------------------------------------------
+fnCreateTranslationList
+
+#-----------------------------------------------------------------------
+# Get and check command line options
+#-----------------------------------------------------------------------
+
+set +u
+fnCheckOptions $*
+set -u
+
+# [ADDED] START - names for this run (group / instance)
+RUNKEY=${GROUP:-ALL}${REFRESH_INSTANCE:+_${REFRESH_INSTANCE}}
+INSTKEY=${REFRESH_INSTANCE:-DEFAULT}
+RUNLOCK=${LOCKROOT}/run_${RUNKEY}.lock
+ACTIVEDIR=${LOCKROOT}/active_${INSTKEY}
+SHARED_MUTEX=${LOCKROOT}/shared_${INSTKEY}.mutex
+mkdir -p ${ACTIVEDIR} || { echo "Cannot create ${ACTIVEDIR}"; exit 1; }
+# [ADDED] END
+
+#-----------------------------------------------------------------------
+# Check if RunRefresh is already running. If so, stop.
+#-----------------------------------------------------------------------
+
+# [CHANGED] original line was: fnCheckRun $0
+# It is now optional, because it may stop other groups of RunRefresh_max.
+if [[ ${USE_ORIGINAL_FNCHECKRUN:-0} = 1 ]]
+then
+        fnCheckRun $0
+fi
+
+# [ADDED] START - own per-group run lock (same purpose as fnCheckRun)
+if ! fnLock ${RUNLOCK} 0
+then
+        echo "Refresh for ${RUNKEY} is already running (PID $(cat ${RUNLOCK}/pid 2>/dev/null)). Exiting."
+        exit 1
+fi
+HAVE_RUN_LOCK=1
+
+trap fnCleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
+# [ADDED] END
+
+#-----------------------------------------------------------------------
+# Make sure the Refresh is being run from the WRAPPER directory.
+#-----------------------------------------------------------------------
+
+if [[ $(/usr/bin/pwd) != ${AIGWRAPPER} ]]
+then
+        fnErrorHandler 68
+        echo "${message}"
+        fnMail "ERROR 68: ${message}"
+        exit 68
+fi
+
+#-----------------------------------------------------------------------
+# Check if all the necessary directories exist.
+# If not, and it's restart, exit with error message.
+# If yes, and it's start, exit with error message.
+# Otherwise, create them.
+#-----------------------------------------------------------------------
+
+fnLock ${LOCKROOT}/setup.mutex 1 || exit 1        # [ADDED]
+fnCheckDirectories $*
+fnUnlockIfMine ${LOCKROOT}/setup.mutex        # [ADDED]
+
+#-----------------------------------------------------------------------
+# Declare main log file and write the appropriate opening messages.
+#-----------------------------------------------------------------------
+
+if [[ ${GROUP} != "" ]]
+then
+        export MLOG=${LOGDIR}/${0#*/}_${GROUP}.log
+else
+        export MLOG=${LOGDIR}/${0#*/}.log
+fi
+
+if [[ ${start} = 1 ]]
+then
+        echo " " > ${MLOG}
+        fnMLog "--- INFO:  Starting Refresh process in start mode.
+                           Process BATCH_ID is ${BATCH_ID}"
+else
+        if [[ ${restart} = 1 ]]
+        then
+                fnMLog "--- INFO:  Starting Refresh process in restart mode.
+                                   Process BATCH_ID is ${BATCH_ID}"
+        else
+                fnMLog "--- INFO:  Starting Refresh process in continuation mode.
+                                   Process BATCH_ID is ${BATCH_ID}"
+        fi
+fi
+
+if [[ ${REFRESH_INSTANCE} != "" ]]
+then
+        fnMLog "        Running against the instance: ${REFRESH_INSTANCE}"
+fi
+
+if [[ ${GROUP} != "" ]]
+then
+        fnMLog "        Processing the group: ${GROUP}"
+fi
+
+#-----------------------------------------------------------------------
+# If Refresh is running in start mode, remove all files from any of the
+# $stage_dir and move them to preload_unknown dir,initialize the
+# Production_Control table i.e. assign 'W' to all the processes that are
+# supposed to run, as well as 0's or NULLs to a few other columns.
+#-----------------------------------------------------------------------
+
+if (( ${start} == 1 ))
+then
+        fnLock ${LOCKROOT}/setup.mutex 1 || exit 1        # [ADDED]
+        fnPreloadUnknownFiles
+        fnCheckFeeders
+        set +u
+        fnInitPC
+        set -u
+        fnUnlockIfMine ${LOCKROOT}/setup.mutex        # [ADDED]
+fi
+
+# muralir
+#exit 0
+#-----------------------------------------------------------------------
+# fnCmd 3 - executes the procedure DROP_PRIVILEGE.granted - which grants $AIGU
+# the privileges to drop tables from any schema.
+#-----------------------------------------------------------------------
+
+#-----------------------------------------------------------------------
+# fnCmd 4 - executes the package tablespace_mode.write which changes
+# tablespace modes to write during the refresh process.
+#-----------------------------------------------------------------------
+
+# [REMOVED] fnCmd 3 / fnRunSql / fnCmd 4 / fnRunSql (now inside fnAcquireShared)
+fnAcquireShared        # [ADDED]
+
+fnRemoveFailureFile
+
+#-----------------------------------------------------------------------
+# RUN MANDATORY PROCESSES FIRST
+#-----------------------------------------------------------------------
+
+MANDATORY='YES'
+fnRunProcesses
+
+#-----------------------------------------------------------------------
+# NOW RUN OPTIONAL PROCESSES\
+#-----------------------------------------------------------------------
+
+fnUpdtPC_PtoW
+MANDATORY='NO'
+fnRunProcesses
+
+#-----------------------------------------------------------------------
+# fnFinalDump -Writes to the master log file all the final counts of running,
+# succeeded, failed, waiting, and ready to run processes.
+#-----------------------------------------------------------------------
+
+fnFinalDump
+
+#-----------------------------------------------------------------------
+# fnMailStatus-Mails the final counts of running, succeeded, failed, waiting,
+# and ready to run processes to everyone listed in the environment variable
+# STATUS_MAIL_LIST.
+#-----------------------------------------------------------------------
+
+fnMailStatus
+if [[ ${GROUP} != "" ]]
+then
+        fnMLog "--- INFO:  There are no running or ready to run processes
+                           in the group ${GROUP}.
+                                   Terminating Refresh Process."
+else
+        fnMLog "--- INFO:  There are no running or ready to run processes.
+                                   Terminating Refresh Process."
+fi
+
+#-----------------------------------------------------------------------
+# fnCmd 5 - executes the procedure DROP_PRIVILEGE.revoked - which revokes $AIGU the
+# privilege to drop tables from other schemas after the refresh is complete
+#-----------------------------------------------------------------------
+
+#-----------------------------------------------------------------------
+# fnCmd 6 - executes the package tablespace_mode.read to change
+# tablespace modes back to read only
+#-----------------------------------------------------------------------
+
+# [REMOVED] fnCmd 5 / fnRunSql / fnCmd 6 / fnRunSql (now inside fnReleaseShared)
+fnReleaseShared        # [ADDED]
+
+exit 0 

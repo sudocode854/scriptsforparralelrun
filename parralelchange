@@ -1,20 +1,240 @@
-#!/bin/bash
+#!/usr/bin/zsh
+##############################################################################
+#
+# Script:   AdhocGenerateReportMasterScript
+#
+# Summary:  Runs child scripts strictly one-by-one in the order listed in
+#           SCRIPT_LIST, updates sadb.production_control for each script
+#           (W = Waiting, R = Running, S = Success, F = Failed),
+#           merges the output CSVs and mails the result.
+#
+# WHO            WHEN         MODIFICATION HISTORY (most recent first)
+#
+# <your name>    <dd/mm/yyyy> Initial
+# ----------------------------------------------------------------------------
+##############################################################################
 
-# Run maximum of below # of parallel process at most
-MAX_NPROC=25
+. ${AIGWRAPPER}/UtilityFuncs
+. ${AIGWRAPPER}/XUtilityFuncs
 
-mkdir -v logs
+# To generate shell debug info to the console log, uncomment next line
+#set -xv
 
-for server in `cat servers.txt`
-do
-        echo "running on $server..."
-        (cat run.sh | ssh -qqq -tt -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o BatchMode=yes $server > logs/$server.log 2>&1) &
-        NPROC=$(($NPROC+1))
-        if [ "$NPROC" -ge "$MAX_NPROC" ]; then
-                echo "max # of parallel processes ($MAX_NPROC) reached! waiting..."
-                wait
-                NPROC=0
-        fi
+LOG=$0.log
+BATCH_ID=$(date +"%Y%m%d")
+
+# ---------------------------------------------------------------------------
+# Locations (log and output both go to /sawork/sauat/tmp)
+# ---------------------------------------------------------------------------
+FILE_LOC=/sawork/sauat/tmp
+LOG_FILE_LOC=/sawork/sauat/tmp
+
+ProcDate=$(date +"%m%d%Y")
+months=(Zero January February March April May June July August September October November December)
+curr_month=$(date -d "$(date +%Y-%m-15) -2 month" +%-m)
+month=${months[${curr_month}+1]}
+OutFileNm=${FILE_LOC}/${month}_KPI_Monthly_refresh_metric_QA_${ProcDate}.csv
+vMailList=shashank.jain@aig.com,bipin.pathak@aig.com
+#vMailList=shashank.jain@aig.com
+
+mkdir -p ${FILE_LOC} && chmod 755 ${FILE_LOC}
+mkdir -p ${LOG_FILE_LOC} && chmod 755 ${LOG_FILE_LOC}
+
+# ---------------------------------------------------------------------------
+# Control table settings
+#   Table   : sadb.production_control
+#   ASSUMED columns: SCRIPT_NAME, BATCH_ID, PROCESS_STATUS, LAST_UPD_TS
+#   -> adjust the column names in the SQL below to match your real table.
+# ---------------------------------------------------------------------------
+CTRL_TABLE="sadb.production_control"
+DB_CONN_ID=110          # same id you pass to fnXCmd in the original script
+
+# ---------------------------------------------------------------------------
+# Scripts to run - ORDER HERE IS THE ORDER OF EXECUTION. Do not reorder.
+# Replace the placeholder names with your real script names.
+# ---------------------------------------------------------------------------
+SCRIPT_LIST=(
+    "Script_Name_1"
+    "Script_Name_2"
+    "Script_Name_3"
+    "Script_Name_4"
+    "Script_Name_5"
+)
+
+echo "=== Starting Master Script ==="
+
+# ---------------------------------------------------------------------------
+# Update status of a script in the control table
+#   usage: update_status <script_name> <W|R|S|F>
+# Does an upsert (update if the row exists, insert if not).
+# ---------------------------------------------------------------------------
+update_status() {
+    local sname=$1
+    local status=$2
+
+    cmd="
+    SET HEAD OFF FEED OFF PAGES 0
+    MERGE INTO ${CTRL_TABLE} t
+    USING (SELECT '${sname}' AS script_name, '${BATCH_ID}' AS batch_id FROM dual) s
+       ON (t.SCRIPT_NAME = s.script_name AND t.BATCH_ID = s.batch_id)
+     WHEN MATCHED THEN
+          UPDATE SET t.PROCESS_STATUS = '${status}', t.LAST_UPD_TS = SYSDATE
+     WHEN NOT MATCHED THEN
+          INSERT (SCRIPT_NAME, BATCH_ID, PROCESS_STATUS, LAST_UPD_TS)
+          VALUES (s.script_name, s.batch_id, '${status}', SYSDATE);
+    COMMIT;"
+    fnXCmd ${DB_CONN_ID}
+
+    if [ $? -ne 0 ]; then
+        echo "WARNING: could not set ${sname} to ${status} in ${CTRL_TABLE}"
+    else
+        echo "${CTRL_TABLE}: ${sname} -> ${status}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Send a failure mail (with the failed script's log attached)
+#   usage: send_failure_mail <script_name> <return_code>
+# ---------------------------------------------------------------------------
+send_failure_mail() {
+    local sname=$1
+    local rcode=$2
+    local logf=${LOG_FILE_LOC}/${sname}.log
+
+    if [ -f ${logf} ]; then
+        mailx -s "FAILED: ${month} monthly report - ${sname} failed !" -a ${logf} ${vMailList} <<EOF
+Hi,
+
+The ${month} monthly report job has FAILED.
+
+Failed script : ${sname}
+Return code   : ${rcode}
+Batch ID      : ${BATCH_ID}
+Log file      : ${logf} (attached)
+
+The master script has stopped. Remaining scripts were not run and are
+still marked W in ${CTRL_TABLE}.
+
+
+Best regards,
+
+KPI Support (email - kpi_support@aig.com )
+
+EOF
+    else
+        mailx -s "FAILED: ${month} monthly report - ${sname} failed !" ${vMailList} <<EOF
+Hi,
+
+The ${month} monthly report job has FAILED.
+
+Failed script : ${sname}
+Return code   : ${rcode}
+Batch ID      : ${BATCH_ID}
+Log file      : not found at ${logf}
+
+The master script has stopped. Remaining scripts were not run and are
+still marked W in ${CTRL_TABLE}.
+
+
+Best regards,
+
+KPI Support (email - kpi_support@aig.com )
+
+EOF
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Run one script and wait for it to finish (foreground, so the next
+# script cannot start until this one has completed)
+# ---------------------------------------------------------------------------
+run_script() {
+    local script_name=$1
+    local rc
+
+    update_status "${script_name}" "R"
+    echo ">>> Starting ${script_name}..."
+
+    ./${script_name} > ${LOG_FILE_LOC}/${script_name}.log 2>&1
+    rc=$?        # capture the exit code immediately
+
+    # move any log the script wrote in the wrapper dir
+    [ -f ${AIGWRAPPER}/${script_name}.log ] && \
+        mv -f ${AIGWRAPPER}/${script_name}.log ${LOG_FILE_LOC}/${script_name}.wrapper.log
+
+    if [ ${rc} -ne 0 ]; then
+        update_status "${script_name}" "F"
+        echo "${script_name} failed (rc=${rc}). Check ${LOG_FILE_LOC}/${script_name}.log"
+        echo "Stopping master script."
+        send_failure_mail "${script_name}" "${rc}"
+        exit 1
+    fi
+
+    update_status "${script_name}" "S"
+    echo "${script_name} completed successfully."
+}
+
+# ---------------------------------------------------------------------------
+# Step 1: mark every script as Waiting before anything starts
+# ---------------------------------------------------------------------------
+for s in "${SCRIPT_LIST[@]}"; do
+    update_status "${s}" "W"
 done
 
-wait
+# ---------------------------------------------------------------------------
+# Step 2: run scripts one by one, in the listed order
+# ---------------------------------------------------------------------------
+for s in "${SCRIPT_LIST[@]}"; do
+    run_script "${s}"
+done
+
+echo "=== all process finished ==="
+
+# ---------------------------------------------------------------------------
+# Step 3: merge all CSVs into one output file
+# ---------------------------------------------------------------------------
+> ${OutFileNm}
+
+for file in ${FILE_LOC}/*.csv; do
+    # skip the merged output file itself
+    [ "${file}" = "${OutFileNm}" ] && continue
+    if [ -f ${file} ]; then
+        echo "Merging: ${file}"
+        echo "### File: $(basename "${file}") ###" >> ${OutFileNm}
+        echo -e "\n" >> ${OutFileNm}
+        cat ${file} >> ${OutFileNm}
+        echo -e "\n\n" >> ${OutFileNm}
+    fi
+done
+echo "${ProcDate} all file merged into ${OutFileNm}"
+
+# ---------------------------------------------------------------------------
+# Step 4: get processing date from DB
+# ---------------------------------------------------------------------------
+cmd="
+    SET TIMING ON
+    SET HEAD OFF FEED OFF PAGES 0
+    select to_char(to_date(${BATCH_ID},'YYYYMMDD'),'YYYY-Mon-DD') from dual;"
+fnXCmd ${DB_CONN_ID}
+
+# parse the output to get the values
+ProcDt=\'$(printf "${output}\n" | head -1)\'
+
+# ---------------------------------------------------------------------------
+# Step 5: mail the merged file
+# ---------------------------------------------------------------------------
+mailx -s "${month} monthly report is generated !" -a ${OutFileNm} ${vMailList} <<EOF
+Hi,
+
+"${month} Monthly report refresh metric" is generated.
+
+File $(basename "${OutFileNm}") is refreshed with ${ProcDt} and available in the attachment.
+
+
+Best regards,
+
+KPI Support (email - kpi_support@aig.com )
+
+EOF
+
+exit 0
